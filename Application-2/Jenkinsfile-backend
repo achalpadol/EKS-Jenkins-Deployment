@@ -1,0 +1,352 @@
+def backendImage
+
+pipeline {
+
+    agent any
+
+    environment {
+
+        // =========================================================
+        // Docker build context
+        // =========================================================
+        BUILD_CONTEXT = './backend'
+
+        // =========================================================
+        // Docker images
+        // =========================================================
+        BACKEND_IMAGE_DEV  = 'achalpadol/app-2-backend'
+        BACKEND_IMAGE_QA   = 'achalpadol/app-2-backend'
+        BACKEND_IMAGE_UAT  = 'achalpadol/app-2-backend'
+        BACKEND_IMAGE_PROD = 'achalpadol/app-2-backend'
+
+        // =========================================================
+        // Docker Hub
+        // =========================================================
+        REGISTRY_URL = 'https://index.docker.io/v1/'
+
+        DEV_DH_CREDENTIALS  = '02_docker_hub_creds'
+        QA_DH_CREDENTIALS   = '02_docker_hub_creds'
+        UAT_DH_CREDENTIALS  = '02_docker_hub_creds'
+        PROD_DH_CREDENTIALS = '02_docker_hub_creds'
+
+        // =========================================================
+        // AWS / EKS
+        // =========================================================
+        AWS_REGION  = 'ap-south-1'
+        EKS_CLUSTER = 'app1-eks'
+    }
+
+    parameters {
+
+        choice(
+            name: 'Environment',
+            choices: ['dev', 'qa', 'uat', 'prod'],
+            description: 'Select deployment environment'
+        )
+
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'For QA/UAT/PROD, enter the image tag to promote. Example: 25'
+        )
+    }
+
+    stages {
+
+        stage('Build Backend Image - DEV') {
+
+            when {
+                expression {
+                    params.Environment == 'dev'
+                }
+            }
+
+            steps {
+                script {
+
+                    backendImage = docker.build(
+                        "${env.BACKEND_IMAGE_DEV}:${env.BUILD_NUMBER}",
+                        env.BUILD_CONTEXT
+                    )
+                }
+            }
+        }
+
+        stage('Push Backend Image - DEV') {
+
+            when {
+                expression {
+                    params.Environment == 'dev'
+                }
+            }
+
+            steps {
+                script {
+
+                    docker.withRegistry(
+                        env.REGISTRY_URL,
+                        env.DEV_DH_CREDENTIALS
+                    ) {
+
+                        backendImage.push(
+                            env.BUILD_NUMBER
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Deploy DEV') {
+
+            when {
+                expression {
+                    params.Environment == 'dev'
+                }
+            }
+
+            steps {
+                script {
+
+                    deployBackendToEKS(
+                        params.Environment,
+                        env.BACKEND_IMAGE_DEV,
+                        env.BUILD_NUMBER
+                    )
+                }
+            }
+        }
+
+        stage('Promote Image to QA') {
+
+            when {
+                expression {
+                    params.Environment == 'qa'
+                }
+            }
+
+            steps {
+                script {
+
+                    promoteImage(
+                        env.BACKEND_IMAGE_DEV,
+                        env.BACKEND_IMAGE_QA,
+                        params.IMAGE_TAG
+                    )
+                }
+            }
+        }
+
+        stage('Deploy QA') {
+
+            when {
+                expression {
+                    params.Environment == 'qa'
+                }
+            }
+
+            steps {
+                script {
+
+                    deployBackendToEKS(
+                        params.Environment,
+                        env.BACKEND_IMAGE_QA,
+                        params.IMAGE_TAG
+                    )
+                }
+            }
+        }
+
+        stage('Promote Image to UAT') {
+
+            when {
+                expression {
+                    params.Environment == 'uat'
+                }
+            }
+
+            steps {
+                script {
+
+                    promoteImage(
+                        env.BACKEND_IMAGE_QA,
+                        env.BACKEND_IMAGE_UAT,
+                        params.IMAGE_TAG
+                    )
+                }
+            }
+        }
+
+        stage('Deploy UAT') {
+
+            when {
+                expression {
+                    params.Environment == 'uat'
+                }
+            }
+
+            steps {
+                script {
+
+                    deployBackendToEKS(
+                        params.Environment,
+                        env.BACKEND_IMAGE_UAT,
+                        params.IMAGE_TAG
+                    )
+                }
+            }
+        }
+
+        stage('Approve PROD') {
+
+            when {
+                expression {
+                    params.Environment == 'prod'
+                }
+            }
+
+            steps {
+
+                input(
+                    message: "Promote image ${params.IMAGE_TAG} to PROD?",
+                    ok: 'Promote to PROD'
+                )
+            }
+        }
+
+        stage('Promote Image to PROD') {
+
+            when {
+                expression {
+                    params.Environment == 'prod'
+                }
+            }
+
+            steps {
+                script {
+
+                    promoteImage(
+                        env.BACKEND_IMAGE_UAT,
+                        env.BACKEND_IMAGE_PROD,
+                        params.IMAGE_TAG
+                    )
+                }
+            }
+        }
+
+        stage('Deploy PROD') {
+
+            when {
+                expression {
+                    params.Environment == 'prod'
+                }
+            }
+
+            steps {
+                script {
+
+                    deployBackendToEKS(
+                        params.Environment,
+                        env.BACKEND_IMAGE_PROD,
+                        params.IMAGE_TAG
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
+
+
+// =============================================================
+// FUNCTION: Deploy Database to EKS
+// =============================================================
+
+def deployBackendToEKS(
+    String environment,
+    String image,
+    String imageTag
+) {
+
+    def namespace = "app-${environment}"
+
+    sh """
+        aws eks update-kubeconfig \
+            --region ${AWS_REGION} \
+            --name ${EKS_CLUSTER}
+
+        echo "Checking namespace ${namespace}"
+
+        kubectl get namespace ${namespace} || \
+        kubectl create namespace ${namespace}
+
+        echo "Applying backend Kubernetes manifests to ${namespace}"
+
+        kubectl apply \
+            -f kube/backend-service.yml \
+            -f kube/backend-deploy.yml \
+            -n ${namespace}
+
+        echo "Updating backend image"
+
+        kubectl -n ${namespace} set image deployment/backend \
+            backend=${image}:${imageTag}
+
+        echo "Waiting for backend rollout"
+
+        kubectl -n ${namespace} rollout status deployment/backend
+    """
+}
+
+// =============================================================
+// FUNCTION: Promote Docker Image
+// =============================================================
+
+def promoteImage(
+    String sourceImage,
+    String targetImage,
+    String imageTag
+) {
+
+    // ---------------------------------------------------------
+    // Pull source image
+    // ---------------------------------------------------------
+
+    docker.withRegistry(
+        env.REGISTRY_URL,
+        env.DEV_DH_CREDENTIALS
+    ) {
+
+        docker.image(
+            "${sourceImage}:${imageTag}"
+        ).pull()
+    }
+
+    // ---------------------------------------------------------
+    // Tag image for target environment
+    // ---------------------------------------------------------
+
+    sh """
+        docker tag \
+            ${sourceImage}:${imageTag} \
+            ${targetImage}:${imageTag}
+    """
+
+    // ---------------------------------------------------------
+    // Push target image
+    // ---------------------------------------------------------
+
+    docker.withRegistry(
+        env.REGISTRY_URL,
+        env.DEV_DH_CREDENTIALS
+    ) {
+
+        docker.image(
+            "${targetImage}:${imageTag}"
+        ).push()
+    }
+}
